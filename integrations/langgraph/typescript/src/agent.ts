@@ -1042,7 +1042,7 @@ export class LangGraphAgent extends AbstractAgent {
 
         if (event.data.chunk.response_metadata.finish_reason) return;
         let currentStream = this.getMessageInProgress(this.activeRun!.id);
-        const hasCurrentStream = Boolean(currentStream?.id);
+        let hasCurrentStream = Boolean(currentStream?.id);
         const toolCallData = event.data.chunk.tool_call_chunks?.[0];
         const toolCallUsedToPredictState = event.metadata[
           "predict_state"
@@ -1051,11 +1051,41 @@ export class LangGraphAgent extends AbstractAgent {
             predictStateTool.tool === toolCallData?.name,
         );
 
-        const isToolCallStartEvent = !hasCurrentStream && toolCallData?.name;
-        const isToolCallArgsEvent =
+        let isToolCallStartEvent = !hasCurrentStream && toolCallData?.name;
+        let isToolCallArgsEvent =
           hasCurrentStream && currentStream?.toolCallId && toolCallData?.args;
-        const isToolCallEndEvent =
+        let isToolCallEndEvent =
           hasCurrentStream && currentStream?.toolCallId && !toolCallData;
+
+        // Boundary transition: a new tool_call begins while another is
+        // mid-stream. Happens when an LLM streams *parallel* tool_calls
+        // sequentially — tool A's chunks arrive, then tool B's chunks arrive
+        // without an intervening empty-chunk terminator. Without this
+        // detection, B's args event (below) would route deltas to A's
+        // tool_call_id, producing concatenated JSON like `{"x":1}{"x":2}` in
+        // the persisted assistant history and leaving B with no Start/End at
+        // all (ag-ui-protocol/ag-ui#871). Mirrors the Python port.
+        if (
+          hasCurrentStream &&
+          currentStream?.toolCallId &&
+          toolCallData &&
+          toolCallData.name &&
+          toolCallData.id &&
+          toolCallData.id !== currentStream.toolCallId
+        ) {
+          this.dispatchEvent({
+            type: EventType.TOOL_CALL_END,
+            toolCallId: currentStream.toolCallId,
+            rawEvent: event,
+          });
+          this.messagesInProcess[this.activeRun!.id] = null;
+          currentStream = null;
+          hasCurrentStream = false;
+          // Re-evaluate the booleans against the now-closed stream.
+          isToolCallStartEvent = Boolean(toolCallData.name);
+          isToolCallArgsEvent = false;
+          isToolCallEndEvent = false;
+        }
 
         if (isToolCallEndEvent || isToolCallArgsEvent || isToolCallStartEvent) {
           this.activeRun!.hasFunctionStreaming = true;
@@ -1143,21 +1173,29 @@ export class LangGraphAgent extends AbstractAgent {
           break;
         }
 
-        if (isToolCallStartEvent && shouldEmitToolCalls) {
-          const resolved = this.dispatchEvent({
-            type: EventType.TOOL_CALL_START,
-            toolCallId: toolCallData.id,
-            toolCallName: toolCallData.name,
-            parentMessageId: event.data.chunk.id,
-            rawEvent: event,
-          });
-          if (resolved) {
-            this.emittedToolCallStartIds.add(toolCallData.id);
-            this.setMessageInProgress(this.activeRun!.id, {
-              id: event.data.chunk.id,
+        if (isToolCallStartEvent) {
+          // Record this tool_call_id as "already streamed" regardless of
+          // shouldEmitToolCalls. OnToolEnd uses this set to decide whether to
+          // re-emit Start/Args/End for the same id; adding it even when
+          // emission is suppressed preserves the behaviour where
+          // hasFunctionStreaming=true blocks the OnToolEnd re-emit for
+          // opted-out tool calls. Mirrors the Python port.
+          this.emittedToolCallStartIds.add(toolCallData.id);
+          if (shouldEmitToolCalls) {
+            const resolved = this.dispatchEvent({
+              type: EventType.TOOL_CALL_START,
               toolCallId: toolCallData.id,
               toolCallName: toolCallData.name,
+              parentMessageId: event.data.chunk.id,
+              rawEvent: event,
             });
+            if (resolved) {
+              this.setMessageInProgress(this.activeRun!.id, {
+                id: event.data.chunk.id,
+                toolCallId: toolCallData.id,
+                toolCallName: toolCallData.name,
+              });
+            }
           }
           break;
         }
